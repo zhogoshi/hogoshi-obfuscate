@@ -229,8 +229,8 @@ async function terserPass(code, module) {
   return result.code;
 }
 
-function obfuscatePass(code) {
-  return JavaScriptObfuscator.obfuscate(code, {
+function obfuscatePass(code, module) {
+  const obfuscated = JavaScriptObfuscator.obfuscate(code, {
     compact: true,
     simplify: true,
     target: "browser",
@@ -252,6 +252,8 @@ function obfuscatePass(code) {
     reservedNames: ["^webpack", "^__webpack", "^__next", "^next", "^self$", "^__NEXT_DATA__$"],
     reservedStrings: ["/_next/", "__NEXT_DATA__", "next/dist", "__next_f"],
   }).getObfuscatedCode();
+  if (module) return obfuscated;
+  return `(()=>{${obfuscated}})();`;
 }
 
 async function optimizeJs(original, { rel, module, stats }) {
@@ -261,7 +263,7 @@ async function optimizeJs(original, { rel, module, stats }) {
     const size = Buffer.byteLength(next);
     if (size >= MIN_OBF_BYTES && size <= MAX_OBF_BYTES) {
       try {
-        const obfuscated = obfuscatePass(next);
+        const obfuscated = obfuscatePass(next, module);
         if (checkSyntax(obfuscated, module)) {
           next = obfuscated;
           stats.js.obfuscated += 1;
