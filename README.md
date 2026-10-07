@@ -10,10 +10,9 @@ Package: [`obfuscate-hogoshi`](https://www.npmjs.com/package/obfuscate-hogoshi)
 
 After `next build`, it rewrites the `.next` output:
 
-- class names such as `text-fg` and `md:grid`
-- CSS variables such as `--fg`
-- `data-slot` values
-- client chunk source, with `javascript-obfuscator`
+- client chunks are minified, then obfuscated
+- CSS and HTML are minified
+- optional gzip and brotli copies of static files
 
 The Turbopack and webpack runtime files are left alone so the app can still start.
 
@@ -34,11 +33,9 @@ pnpm build
 obfuscate-hogoshi .next
 ```
 
-The default profile is `balanced`. `fast` keeps the build smaller. `paranoid` adds heavier transforms on chunks that stay valid.
-
 ```bash
-obfuscate-hogoshi .next --profile=fast
-obfuscate-hogoshi .next --profile=paranoid
+obfuscate-hogoshi .next --precompress
+obfuscate-hogoshi .next --no-css --no-html
 ```
 
 From a checkout of this repository, before the package is on npm:

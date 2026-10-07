@@ -1,42 +1,26 @@
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join, relative } from "node:path";
+import { brotliCompressSync, constants as zc, gzipSync } from "node:zlib";
 import vm from "node:vm";
+import { minify as terserMinify } from "terser";
 import JavaScriptObfuscator from "javascript-obfuscator";
 
-const TEXT_EXTENSIONS = new Set([".js", ".css", ".html", ".rsc"]);
+const TEXT_EXTENSIONS = new Set([".js", ".css", ".html"]);
 const SKIP_DIRS = new Set(["cache", "node_modules", "trace", ".vercel"]);
 const RUNTIME_FILE = /(?:^|\/)(?:webpack|turbopack|polyfills|framework|main-app|main)[-.]/;
-const RESERVED_CLASS = new Set(["dark", "light", "container"]);
-const RESERVED_CLASS_PREFIX = ["hljs-", "language-", "prose", "shiki-"];
-const RESERVED_VAR_PREFIX = ["--tw-", "--next", "--rsc", "--react"];
+const COMPRESSIBLE = new Set([".js", ".css", ".svg", ".json", ".html", ".txt", ".webmanifest"]);
 
-const TOKEN_HEAD = "αβγδεζηθικλμνξοπρστυφχψωабвгдежзийклмнопрстуфхцчшщъыьэюя";
-const TOKEN_TAIL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" + TOKEN_HEAD;
+const WEBPACK_RESERVED = [
+  "webpackChunk_N_E", "__webpack_require__", "__webpack_modules__", "__webpack_exports__",
+  "__NEXT_DATA__", "__next", "__next_f",
+];
 
-function bijective(value, alphabet) {
-  const base = alphabet.length;
-  let out = "";
-  while (value > 0) {
-    out = alphabet[(value - 1) % base] + out;
-    value = Math.floor((value - 1) / base);
-  }
-  return out;
-}
+const MIN_OBF_BYTES = 2048;
+const MAX_OBF_BYTES = 1_200_000;
 
-function makeTokenGenerator(prefix = "") {
-  let counter = randomBytes(2).readUInt16BE(0);
-  return () => {
-    const name =
-      prefix + TOKEN_HEAD[counter % TOKEN_HEAD.length] + bijective(Math.floor(counter / TOKEN_HEAD.length) + 1, TOKEN_TAIL);
-    counter += 1;
-    return name;
-  };
-}
-
-function walk(dir, files = []) {
+function walk(dir, files = [], extensions = TEXT_EXTENSIONS) {
   let entries = [];
   try {
     entries = readdirSync(dir);
@@ -52,239 +36,176 @@ function walk(dir, files = []) {
       continue;
     }
     if (info.isDirectory()) {
-      if (!SKIP_DIRS.has(entry)) walk(path, files);
+      if (!SKIP_DIRS.has(entry)) walk(path, files, extensions);
       continue;
     }
-    if (TEXT_EXTENSIONS.has(extname(path))) files.push(path);
+    if (!extensions || extensions.has(extname(path))) files.push(path);
   }
   return files;
 }
 
-function isClientScript(file, root) {
-  const path = relative(root, file).replaceAll("\\", "/");
-  return path.startsWith("static/chunks/") && path.endsWith(".js") && !RUNTIME_FILE.test(path);
-}
 
-function cssEscape(value) {
-  return value.replace(/[^\p{L}\p{N}_-]/gu, "\\$&");
-}
+const CSS_WS = " \t\n\r\f";
 
-function unescapeCssIdent(value) {
-  return value.replace(/\\(.)/g, "$1");
-}
-
-function shouldMangleClass(name) {
-  if (name.length < 2 || name.startsWith("_") || name.includes("${")) return false;
-  if (!/^[A-Za-z-]/.test(name)) return false;
-  if (RESERVED_CLASS.has(name)) return false;
-  if (!/[-:/.[\]0-9]/.test(name)) return false;
-  return !RESERVED_CLASS_PREFIX.some((prefix) => name.startsWith(prefix));
-}
-
-function collectClasses(cssFiles) {
-  const names = new Set();
-  const pattern = /(?<![A-Za-z0-9])\.((?:\\.|[A-Za-z0-9_-])+)/g;
-  for (const file of cssFiles) {
-    const css = readFileSync(file, "utf8");
-    for (const match of css.matchAll(pattern)) {
-      const name = unescapeCssIdent(match[1]);
-      if (shouldMangleClass(name)) names.add(name);
-    }
-  }
-  return [...names].sort((left, right) => right.length - left.length);
-}
-
-function collectVariables(cssFiles) {
-  const names = new Set();
-  const pattern = /(?<![\w-])(--[A-Za-z][\w-]*)/g;
-  for (const file of cssFiles) {
-    const css = readFileSync(file, "utf8");
-    for (const match of css.matchAll(pattern)) {
-      if (RESERVED_VAR_PREFIX.some((prefix) => match[1].startsWith(prefix))) continue;
-      names.add(match[1]);
-    }
-  }
-  return [...names].sort((left, right) => right.length - left.length);
-}
-
-function collectSlots(files) {
-  const names = new Set();
-  const pattern = /data-slot\\?["']?\s*[:=,]\s*\\?["']?([A-Za-z][\w-]*)/g;
-  for (const file of files) {
-    const text = readFileSync(file, "utf8");
-    for (const match of text.matchAll(pattern)) {
-      if (!match[1].startsWith("_")) names.add(match[1]);
-    }
-  }
-  return [...names].sort((left, right) => right.length - left.length);
-}
-
-function makePairReplacer(pairs) {
-  if (!pairs.length) return (text) => text;
-  const sorted = [...pairs].sort((left, right) => right[0].length - left[0].length);
-  const body = sorted.map(([from]) => from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-  const re = new RegExp(`(?<![A-Za-z0-9_-])(?:${body})(?![A-Za-z0-9_-])`, "g");
-  const map = new Map(pairs);
-  return (text) => text.replace(re, (found) => map.get(found) ?? found);
-}
-
-function replaceSlots(text, pairs) {
-  for (const [name, mangled] of pairs) {
-    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(`(data-slot\\\\?["']?\\s*[:=,]\\s*\\\\?["']?)${esc}(?![\\w-])`, "g");
-    text = text.replace(re, `$1${mangled}`);
-  }
-  return text;
-}
-
-function endOfExpression(source, start) {
-  let depth = 1;
-  let index = start;
-  while (index < source.length && depth > 0) {
-    const ch = source[index];
-    if (ch === '"' || ch === "'" || ch === "`") {
-      index = endOfString(source, index);
-      continue;
-    }
-    if (ch === "{") depth += 1;
-    if (ch === "}") depth -= 1;
-    index += 1;
-  }
-  return index;
-}
-
-function endOfString(source, start) {
-  const quote = source[start];
-  let index = start + 1;
-  while (index < source.length) {
-    const ch = source[index];
-    if (ch === "\\") {
-      index += 2;
-      continue;
-    }
-    if (quote === "`" && ch === "$" && source[index + 1] === "{") {
-      index = endOfExpression(source, index + 2);
-      continue;
-    }
-    index += 1;
-    if (ch === quote) return index;
-  }
-  return source.length;
-}
-
-function replaceString(literal, replacer) {
-  const quote = literal[0];
-  if (quote !== '"' && quote !== "'" && quote !== "`") return literal;
-  const closed = literal.endsWith(quote);
-  const body = literal.slice(1, closed ? -1 : undefined);
-  const next = quote === "`" ? replaceTemplate(body, replacer) : replacer(body);
-  return quote + next + (closed ? quote : "");
-}
-
-function replaceTemplate(body, replacer) {
+function minifyCss(css) {
   let out = "";
-  let index = 0;
-  while (index < body.length) {
-    if (body[index] === "\\") {
-      out += body.slice(index, index + 2);
-      index += 2;
+  let depth = 0;
+  let i = 0;
+  const n = css.length;
+  const prevChar = () => (out.length ? out[out.length - 1] : "");
+
+  while (i < n) {
+    const ch = css[i];
+
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      while (j < n) {
+        if (css[j] === "\\") { j += 2; continue; }
+        if (css[j] === ch) break;
+        j += 1;
+      }
+      out += css.slice(i, Math.min(j + 1, n));
+      i = j + 1;
       continue;
     }
-    if (body[index] === "$" && body[index + 1] === "{") {
-      const end = endOfExpression(body, index + 2);
-      out += `\${${replaceInStrings(body.slice(index + 2, end - 1), replacer)}}`;
-      index = end;
+
+    if (ch === "/" && css[i + 1] === "*") {
+      const end = css.indexOf("*/", i + 2);
+      const stop = end === -1 ? n : end + 2;
+      if (end !== -1 && /^!|@preserve|@license/i.test(css.slice(i + 2, end).trim())) out += css.slice(i, stop);
+      i = stop;
       continue;
     }
-    const next = body.slice(index).search(/\$\{|\\/);
-    const end = next === -1 ? body.length : index + next;
-    out += replacer(body.slice(index, end));
-    index = end;
+
+    if (ch === "u" && /^url\(/i.test(css.slice(i, i + 4)) && !/[A-Za-z0-9_-]$/.test(prevChar())) {
+      const m = /^url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"][^)]*?))\s*\)/i.exec(css.slice(i));
+      if (m) {
+        const inner = m[1] ?? m[2] ?? m[3] ?? "";
+        out += /^[\w\-./%#?=&+:~]+$/.test(inner) ? `url(${inner})` : m[0];
+        i += m[0].length;
+        continue;
+      }
+    }
+
+    if (CSS_WS.includes(ch)) {
+      let j = i;
+      while (j < n && CSS_WS.includes(css[j])) j += 1;
+      const prev = prevChar();
+      const next = css[j] ?? "";
+      const dropBefore = "{};>,+~:,".includes(prev);
+      const dropAfter = "{};>,+~,".includes(next);
+      if (depth === 0 && (dropBefore || dropAfter)) { i = j; continue; }
+      out += " ";
+      i = j;
+      continue;
+    }
+
+    if (ch === ";") {
+      let j = i + 1;
+      while (j < n && CSS_WS.includes(css[j])) j += 1;
+      if (css[j] === "}" && depth === 0) { i += 1; continue; }
+      out += ";";
+      i += 1;
+      continue;
+    }
+
+    if (ch === "#") {
+      const m = /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})(?![0-9a-fA-F])/.exec(css.slice(i));
+      const prev = prevChar();
+      if (m && depth === 0 && (prev === ":" || prev === "(")) {
+        const h = m[1];
+        if (h[0] === h[1] && h[2] === h[3] && h[4] === h[5] && (h.length === 6 || h[6] === h[7])) {
+          out += `#${h[0]}${h[2]}${h[4]}${h.length === 8 ? h[6] : ""}`;
+          i += m[0].length;
+          continue;
+        }
+      }
+    }
+
+    if (ch === "0" && css[i + 1] === "." && !/[A-Za-z0-9_.]/.test(prevChar())) {
+      out += ".";
+      i += 2;
+      continue;
+    }
+
+    if (ch === "(") { depth += 1; out += ch; i += 1; continue; }
+    if (ch === ")") { depth = Math.max(0, depth - 1); out += ch; i += 1; continue; }
+
+    out += ch;
+    i += 1;
+  }
+  return out.trim();
+}
+
+
+const HTML_RAW = /^<(pre|textarea|script|style)(?=[\s>/])/i;
+
+function copyTag(html, i) {
+  const n = html.length;
+  let j = i + 1;
+  while (j < n) {
+    const c = html[j];
+    if (c === '"' || c === "'") {
+      j += 1;
+      while (j < n && html[j] !== c) j += 1;
+      j += 1;
+      continue;
+    }
+    if (c === ">") return j + 1;
+    j += 1;
+  }
+  return n;
+}
+
+function minifyHtml(html) {
+  let out = "";
+  let i = 0;
+  const n = html.length;
+  while (i < n) {
+    if (html.startsWith("<!--", i)) {
+      const end = html.indexOf("-->", i + 4);
+      const stop = end === -1 ? n : end + 3;
+      const body = html.slice(i + 4, end === -1 ? n : end);
+      const keep = /^\s*(\[if|#|!|\/?\$)/.test(body) || body.includes("$");
+      if (keep) out += html.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    const raw = html[i] === "<" && HTML_RAW.exec(html.slice(i));
+    if (raw) {
+      const tag = raw[1].toLowerCase();
+      const openEnd = copyTag(html, i);
+      const m = new RegExp(`</${tag}\\s*>`, "i").exec(html.slice(openEnd));
+      const stop = m ? openEnd + m.index + m[0].length : n;
+      out += html.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    if (html[i] === "<") {
+      const stop = copyTag(html, i);
+      out += html.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    const next = html.indexOf("<", i);
+    const stop = next === -1 ? n : next;
+    out += html.slice(i, stop).replace(/\s+/g, " ");
+    i = stop;
   }
   return out;
 }
 
-function replaceInStrings(source, replacer) {
-  let out = "";
-  let index = 0;
-  while (index < source.length) {
-    const ch = source[index];
-    if (ch !== '"' && ch !== "'" && ch !== "`") {
-      out += ch;
-      index += 1;
-      continue;
+
+function checkSyntax(code, module = false) {
+  if (!module) {
+    try {
+      new vm.Script(code);
+      return true;
+    } catch {
+      return false;
     }
-    const end = endOfString(source, index);
-    out += replaceString(source.slice(index, end), replacer);
-    index = end;
   }
-  return out;
-}
-
-function rewriteCss(css, classPairs, varPairs) {
-  for (const [name, mangled] of classPairs) {
-    const from = `.${cssEscape(name)}`;
-    if (!css.includes(from)) continue;
-    css = css.split(from).join(`.${cssEscape(mangled)}`);
-  }
-  for (const [name, mangled] of varPairs) {
-    if (!css.includes(name)) continue;
-    css = css.split(name).join(mangled);
-  }
-  return css;
-}
-
-const SCRIPT_RE = /(<script\b[^>]*>)([\s\S]*?)(<\/script\s*>)/gi;
-const PRE_RE = /(<(?:pre|textarea)\b[^>]*>)[\s\S]*?(<\/(?:pre|textarea)\s*>)/gi;
-
-function rewriteAttribute(text, attr, replacer) {
-  const re = new RegExp(`(?<![-\\w])${attr}(\\s*=\\s*)(["'])([\\s\\S]*?)\\3`, "gi");
-  return text.replace(re, (_m, eq, quote, value) => `${attr}${eq}${quote}${replacer(value)}${quote}`);
-}
-
-function minifyChunk(chunk) {
-  return chunk.replace(/<!--(?!\[if)[\s\S]*?-->/g, "").replace(/\s+/g, " ");
-}
-
-function minifyHtmlText(text) {
-  let out = "";
-  let last = 0;
-  PRE_RE.lastIndex = 0;
-  let match;
-  while ((match = PRE_RE.exec(text)) !== null) {
-    out += minifyChunk(text.slice(last, match.index)) + match[0];
-    last = match.index + match[0].length;
-  }
-  return out + minifyChunk(text.slice(last));
-}
-
-function rewriteHtmlSegment(text, classReplacer, varReplacer, minify) {
-  let out = rewriteAttribute(text, "class", classReplacer);
-  out = rewriteAttribute(out, "style", varReplacer);
-  return minify ? minifyHtmlText(out) : out;
-}
-
-function processHtml(html, classReplacer, varReplacer, scriptReplacer, minify) {
-  let out = "";
-  let last = 0;
-  SCRIPT_RE.lastIndex = 0;
-  let match;
-  while ((match = SCRIPT_RE.exec(html)) !== null) {
-    out += rewriteHtmlSegment(html.slice(last, match.index), classReplacer, varReplacer, minify);
-    out += match[1] + replaceInStrings(match[2], scriptReplacer) + match[3];
-    last = match.index + match[0].length;
-  }
-  return out + rewriteHtmlSegment(html.slice(last), classReplacer, varReplacer, minify);
-}
-
-function parses(code) {
-  try {
-    new vm.Script(code);
-    return true;
-  } catch (error) {
-    if (!(error instanceof SyntaxError)) return false;
-  }
-  const dir = mkdtempSync(join(tmpdir(), "hogoshi-check-"));
+  const dir = mkdtempSync(join(tmpdir(), "slim-check-"));
   try {
     const file = join(dir, "chunk.mjs");
     writeFileSync(file, code);
@@ -297,103 +218,133 @@ function parses(code) {
   }
 }
 
-const PROFILES = {
-  fast: { identifiers: "mangled", strings: 0, wrappers: 1, splitStrings: false, numbers: false, cff: false, deadCode: false, selfDefending: false },
-  balanced: { identifiers: "hexadecimal", strings: 0.75, wrappers: 1, splitStrings: false, numbers: true, cff: false, deadCode: false, selfDefending: false },
-  paranoid: { identifiers: "hexadecimal", strings: 1, wrappers: 2, splitStrings: true, numbers: true, cff: true, deadCode: true, selfDefending: true },
-};
+async function terserPass(code, module) {
+  const result = await terserMinify(code, {
+    module,
+    compress: { passes: 2, defaults: true, drop_debugger: true },
+    mangle: { toplevel: false, reserved: WEBPACK_RESERVED },
+    format: { comments: "some", ecma: 2020 },
+  });
+  if (typeof result.code !== "string" || result.code.length === 0) throw new Error("empty terser output");
+  return result.code;
+}
 
-const MAX_SCRIPT_BYTES = 3_000_000;
-const CFF_MAX_BYTES = 400_000;
-const DEAD_CODE_MAX_BYTES = 150_000;
-
-function obfuscateScript(code, profile) {
-  const size = Buffer.byteLength(code);
-  if (size > MAX_SCRIPT_BYTES) throw new Error(`chunk too big: ${size} bytes`);
+function obfuscatePass(code) {
   return JavaScriptObfuscator.obfuscate(code, {
     compact: true,
     simplify: true,
-    identifierNamesGenerator: profile.identifiers,
+    target: "browser",
+    identifierNamesGenerator: "mangled",
     renameGlobals: false,
     transformObjectKeys: false,
-    stringArray: profile.strings > 0,
-    stringArrayThreshold: profile.strings,
+    stringArray: true,
+    stringArrayThreshold: 1,
     stringArrayEncoding: ["base64"],
-    stringArrayWrappersCount: profile.wrappers,
-    stringArrayWrappersType: "function",
-    splitStrings: profile.splitStrings,
-    splitStringsChunkLength: 10,
-    numbersToExpressions: profile.numbers,
-    controlFlowFlattening: profile.cff && size < CFF_MAX_BYTES,
-    controlFlowFlatteningThreshold: 0.75,
-    deadCodeInjection: profile.deadCode && size < DEAD_CODE_MAX_BYTES,
-    deadCodeInjectionThreshold: 0.4,
-    selfDefending: profile.selfDefending,
+    stringArrayWrappersCount: 1,
+    stringArrayWrappersType: "variable",
+    splitStrings: false,
+    numbersToExpressions: false,
+    controlFlowFlattening: false,
+    deadCodeInjection: false,
+    selfDefending: false,
     debugProtection: false,
     unicodeEscapeSequence: false,
-    reservedNames: ["^webpack", "^__webpack", "^__next", "^next", "^self$"],
+    reservedNames: ["^webpack", "^__webpack", "^__next", "^next", "^self$", "^__NEXT_DATA__$"],
     reservedStrings: ["/_next/", "__NEXT_DATA__", "next/dist", "__next_f"],
   }).getObfuscatedCode();
 }
 
-export async function obfuscateBuild(root, options = {}) {
-  const profileName = options.profile ?? "balanced";
-  const profile = PROFILES[profileName];
-  if (!profile) throw new Error(`Unknown profile ${profileName}`);
-  const minifyHtml = options.minifyHtml !== false;
-
-  const files = walk(root);
-  const cssFiles = files.filter((file) => file.endsWith(".css"));
-
-  const nextClass = makeTokenGenerator();
-  const nextVar = makeTokenGenerator("--");
-  const nextSlot = makeTokenGenerator();
-
-  const classPairs = collectClasses(cssFiles).map((name) => [name, nextClass()]);
-  const varPairs = collectVariables(cssFiles).map((name) => [name, nextVar()]);
-  const slotPairs = collectSlots(files).map((name) => [name, nextSlot()]);
-
-  const classReplacer = makePairReplacer(classPairs);
-  const varReplacer = makePairReplacer(varPairs);
-  const scriptReplacer = makePairReplacer(classPairs.concat(varPairs));
-
-  let bytesBefore = 0;
-  let bytesAfter = 0;
-  let scripts = 0;
-  const skipped = [];
-
-  for (const file of files) {
-    const original = readFileSync(file, "utf8");
-    let text = replaceSlots(original, slotPairs);
-
-    if (file.endsWith(".css")) {
-      text = rewriteCss(text, classPairs, varPairs);
-    } else if (file.endsWith(".html")) {
-      text = processHtml(text, classReplacer, varReplacer, scriptReplacer, minifyHtml);
-    } else {
-      text = replaceInStrings(text, scriptReplacer);
-    }
-
-    if (isClientScript(file, root)) {
+async function optimizeJs(original, { rel, module, stats }) {
+  try {
+    let next = await terserPass(original, module);
+    if (!checkSyntax(next, module)) throw new Error("terser output does not parse");
+    const size = Buffer.byteLength(next);
+    if (size >= MIN_OBF_BYTES && size <= MAX_OBF_BYTES) {
       try {
-        const obfuscated = obfuscateScript(text, profile);
-        if (!parses(obfuscated)) throw new Error("output does not parse");
-        text = obfuscated;
-        scripts += 1;
+        const obfuscated = obfuscatePass(next);
+        if (checkSyntax(obfuscated, module)) {
+          next = obfuscated;
+          stats.js.obfuscated += 1;
+        } else {
+          console.error(`obfuscator output invalid, keeping terser: ${rel}`);
+        }
       } catch (error) {
-        skipped.push(relative(root, file));
-        console.error(`skip script ${relative(root, file)}: ${error instanceof Error ? error.message : "failed"}`);
+        console.error(`obfuscator failed, keeping terser: ${rel}: ${error instanceof Error ? error.message : "failed"}`);
       }
     }
+    return next;
+  } catch (error) {
+    stats.js.skipped.push(rel);
+    console.error(`skip ${rel}: ${error instanceof Error ? error.message : "unknown"}`);
+    return original;
+  }
+}
 
-    if (text !== original) {
-      writeFileSync(file, text);
-      rmSync(`${file}.map`, { force: true });
+
+function precompressStatic(root) {
+  let files = 0, before = 0, gzip = 0, brotli = 0;
+  for (const file of walk(root, [], null)) {
+    const rel = relative(root, file).replaceAll("\\", "/");
+    if (!rel.startsWith("static/") || !COMPRESSIBLE.has(extname(file))) continue;
+    const content = readFileSync(file);
+    const gz = gzipSync(content, { level: 9 });
+    const br = brotliCompressSync(content, { params: { [zc.BROTLI_PARAM_QUALITY]: 6 } });
+    writeFileSync(`${file}.gz`, gz);
+    writeFileSync(`${file}.br`, br);
+    files += 1;
+    before += content.length;
+    gzip += gz.length;
+    brotli += br.length;
+  }
+  return { files, before, gzip, brotli };
+}
+
+
+export async function optimizeBuild(root, options = {}) {
+  const doCss = options.css !== false;
+  const doHtml = options.html !== false;
+
+  const stats = {
+    js: { files: 0, before: 0, after: 0, obfuscated: 0, skipped: [] },
+    css: { files: 0, before: 0, after: 0 },
+    html: { files: 0, before: 0, after: 0 },
+    precompressed: null,
+  };
+
+  for (const file of walk(root)) {
+    const rel = relative(root, file).replaceAll("\\", "/");
+    const ext = extname(file);
+    const original = readFileSync(file, "utf8");
+    let text = original;
+
+    if (ext === ".js" && rel.startsWith("static/") && !RUNTIME_FILE.test(rel)) {
+      const module = /^\s*(?:import|export)[\s{("']/m.test(original);
+      text = await optimizeJs(original, { rel, module, stats });
+      if (text !== original) {
+        writeFileSync(file, text);
+        rmSync(`${file}.map`, { force: true });
+      }
+      stats.js.files += 1;
+      stats.js.before += Buffer.byteLength(original);
+      stats.js.after += Buffer.byteLength(text);
+    } else if (ext === ".css" && doCss) {
+      text = minifyCss(original);
+      if (text !== original) {
+        writeFileSync(file, text);
+        rmSync(`${file}.map`, { force: true });
+      }
+      stats.css.files += 1;
+      stats.css.before += Buffer.byteLength(original);
+      stats.css.after += Buffer.byteLength(text);
+    } else if (ext === ".html" && doHtml) {
+      text = minifyHtml(original);
+      if (text !== original) writeFileSync(file, text);
+      stats.html.files += 1;
+      stats.html.before += Buffer.byteLength(original);
+      stats.html.after += Buffer.byteLength(text);
     }
-
-    bytesBefore += Buffer.byteLength(original);
-    bytesAfter += Buffer.byteLength(text);
   }
 
-  return { files: files.length, classes: classPairs.length, variables: varPairs.length, slots: slotPairs.length, scripts, skipped, bytesBefore, bytesAfter };
+  if (options.precompress === true) stats.precompressed = precompressStatic(root);
+  return stats;
 }
