@@ -34,6 +34,13 @@ pnpm build
 obfuscate-hogoshi .next
 ```
 
+The default profile is `balanced`. `fast` keeps the build smaller. `paranoid` adds heavier transforms on chunks that stay valid.
+
+```bash
+obfuscate-hogoshi .next --profile=fast
+obfuscate-hogoshi .next --profile=paranoid
+```
+
 From a checkout of this repository, before the package is on npm:
 
 ```bash
