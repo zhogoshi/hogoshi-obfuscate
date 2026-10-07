@@ -1,0 +1,23 @@
+{
+  "name": "obfuscate-hogoshi",
+  "version": "0.1.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhogoshi/hogoshi-obfuscate.git"
+  },
+  "bin": {
+    "obfuscate-hogoshi": "./src/cli.js"
+  },
+  "files": ["src"],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "javascript-obfuscator": "^5.5.0"
+  }
+}
