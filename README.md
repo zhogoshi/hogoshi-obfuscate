@@ -46,4 +46,4 @@ node src/cli.js /path/to/app/.next
 
 Run it only on a production build you are about to ship. Do not commit the rewritten `.next` folder.
 
-Landing, template, storybook, and eneru/web run `pnpm exec obfuscate-hogoshi .next` in their Docker image after `next build`. Local `pnpm dev` does not. A new app from `create-hogoshi` inherits the template image, so that image does.
+Landing, template, and storybook run `pnpm exec obfuscate-hogoshi .next` in their Docker image after `next build`. Local `pnpm dev` does not. A new app from `create-hogoshi` inherits the template image, so that image does.
