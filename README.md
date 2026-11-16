@@ -34,3 +34,7 @@ Wrap a function in `protect("hogoshi:vm", fn)` from `@hogoshi/ui` to compile it 
 - Supported: variables, loops, branches, `try`/`catch`, closures, optional chaining, logical and arithmetic operators, objects, arrays, templates, member calls, `new`, `typeof`, `delete`, regex literals.
 - Not supported (the function stays plain and is listed in the report): `async`, generators, classes, destructuring, spread, `for...of`/`for...in`, `switch`, labels, `super`, `finally`, function declarations, `arguments`, writes to outer variables, and loop-scoped `let` captured by closures.
 - Mark small, sensitive functions only; virtualized code is much slower than native.
+
+## Asset names
+
+Every built `.js` and `.css` file under `static/` and the build id directory get new names derived from the seed and the obfuscator version, and all references are updated. Without this, a CDN or browser that cached an earlier build under the same immutable name would serve old files against the new HTML.

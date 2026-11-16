@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { brotliCompressSync, constants, gzipSync } from "node:zlib";
+import { renameAssets } from "./assets.js";
 import { collectClasses, createNames, createRewriter, DEFAULT_KEEP, parseCode } from "./classes.js";
 import { verify } from "./gate.js";
 import { inventory, measure, classify, walk } from "./inventory.js";
@@ -136,7 +137,13 @@ export async function build(source, options) {
     if (options.mapsOut) archiveMaps(staging, resolve(options.mapsOut));
     const before = measure(staging);
     const seed = options.seed ?? createHash("sha256").update(readSheets(staging).join("\0")).digest("hex");
-    const { changed, hardened, virtualized, skipped, names } = await transform(staging, seed);
+    const result = await transform(staging, seed);
+    const renames = renameAssets(staging, seed);
+    const relocate = (rel) => rel.split("/").map((part) => renames.get(part) ?? part).join("/");
+    const { names, skipped } = result;
+    const changed = new Set([...result.changed].map(relocate));
+    const hardened = result.hardened.map(relocate);
+    const virtualized = result.virtualized.map((entry) => ({ ...entry, path: relocate(entry.path) }));
     const problems = verify(staging, { mode: options.mode, changed, names });
     if (problems.length) throw new Error(`release gate failed:\n${problems.slice(0, 20).map((problem) => `  ${problem}`).join("\n")}`);
 

@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { build } from "../src/build.js";
+
+const chunk = (out, ext) => {
+  const name = readdirSync(join(out, "static/chunks")).find((file) => file.endsWith(ext));
+  return readFileSync(join(out, "static/chunks", name), "utf8");
+};
 
 const layout = (html) => {
   const root = join(mkdtempSync(join(tmpdir(), "hg-")), ".next");
@@ -24,7 +29,7 @@ test("server-build output has no maps and keeps the source untouched", async () 
   assert.ok(existsSync(join(root, "static/chunks/a.js.map")));
   assert.ok(!existsSync(join(out, "static/chunks/a.js.map")));
   assert.ok(existsSync(join(maps, "static/chunks/a.js.map")));
-  assert.ok(!readFileSync(join(out, "static/chunks/a.js"), "utf8").includes("sourceMappingURL"));
+  assert.ok(!chunk(out, ".js").includes("sourceMappingURL"));
 });
 
 test("the release gate rejects a missing asset and publishes nothing", async () => {
@@ -62,7 +67,7 @@ test("hardened code behaves like the original", async () => {
   const expected = new Function(`${source}; return globalThis.result;`)();
   const out = join(root, "..", "behaviour");
   await build(root, { mode: "server-build", out, seed: "t" });
-  const text = readFileSync(join(out, "static/chunks/a.js"), "utf8");
+  const text = chunk(out, ".js");
   assert.ok(!text.includes('"#"'));
   const actual = new Function(`${text}; return globalThis.result;`)();
   assert.deepEqual(actual, expected);
@@ -83,7 +88,21 @@ test("marked functions are virtualized inside a build", async () => {
   const out = join(root, "..", "vm");
   const report = await build(root, { mode: "server-build", out, seed: "t" });
   assert.equal(report.virtualized[0].functions, 1);
-  const text = readFileSync(join(out, "static/chunks/a.js"), "utf8");
+  const text = chunk(out, ".js");
   assert.ok(!text.includes("hogoshi:vm"));
   assert.equal(new Function(`${text}; return globalThis.result;`)(), 30);
+});
+
+test("asset names change so cached copies of the old build cannot be reused", async () => {
+  const root = layout('<link rel="stylesheet" href="/_next/static/chunks/a.css"/><script src="/_next/static/chunks/a.js"></script>');
+  const out = join(root, "..", "renamed");
+  await build(root, { mode: "server-build", out, seed: "t" });
+  const html = readFileSync(join(out, "server/page.html"), "utf8");
+  const refs = [...html.matchAll(/\/_next\/static\/chunks\/([\w-]+\.(?:css|js))/g)].map((match) => match[1]);
+  assert.equal(refs.length, 2);
+  for (const name of refs) {
+    assert.notEqual(name, "a.css");
+    assert.notEqual(name, "a.js");
+    assert.ok(existsSync(join(out, "static/chunks", name)));
+  }
 });
